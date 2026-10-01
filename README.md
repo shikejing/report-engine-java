@@ -1,0 +1,234 @@
+# report-engine-java：报表定义与渲染服务
+
+声明式报表定义的提交、校验、版本化保存与确定性渲染服务。
+
+- 使用方提交 JSON 声明式报表定义，服务端**完整校验**后按版本保存；
+- 渲染时**精确定位到某一个已提交的定义版本**，同一份定义 + 同一份数据反复渲染结果逐字节一致；
+- 输出**按批返回**，支持取消 / 超时，失败中间产物整体丢弃；
+- 所有读写操作按 `X-Scope` 作用域鉴权，越权返回 404，不泄漏存在性。
+
+---
+
+## 1. 快速开始
+
+```bash
+mvn spring-boot:build-image   # 或 mvn package
+java -jar target/report-engine-java-1.0-SNAPSHOT.jar
+```
+
+服务默认监听 `8080`，数据落在 `./data`（见[配置项](#7-配置项)）。
+
+### 1.1 提交定义
+
+```bash
+curl -X POST http://localhost:8080/api/definitions \
+  -H 'X-Scope: tenant-a' -H 'Content-Type: application/json' \
+  -d '{
+    "name": "sales",
+    "description": "销售报表",
+    "columns": [
+      {"field": "id",     "header": "编号", "type": "STRING"},
+      {"field": "amount", "header": "金额", "type": "NUMBER", "format": "#,##0.00"},
+      {"field": "day",    "header": "日期", "type": "DATE",   "format": "yyyy-MM-dd"},
+      {"field": "active", "header": "有效", "type": "BOOLEAN"}
+    ],
+    "sort": {"field": "day", "direction": "ASC"}
+  }'
+```
+
+返回 `201`，含服务端元数据：
+
+```json
+{"scope":"tenant-a","name":"sales","version":1,"formatVersion":2,"createdAt":"...","content":{...}}
+```
+
+### 1.2 提交渲染
+
+```bash
+curl -X POST http://localhost:8080/api/render-jobs \
+  -H 'X-Scope: tenant-a' -H 'Content-Type: application/json' \
+  -d '{
+    "defName": "sales",
+    "defVersion": 1,
+    "format": "JSON",
+    "batchSize": 500,
+    "data": [
+      {"id":"a1","amount":12.5,"day":"2024-01-02","active":true},
+      {"id":"a2","amount":100,"day":1704067200000,"active":false}
+    ]
+  }'
+```
+
+返回作业 `201`，轮询 `GET /api/render-jobs/{jobId}` 直到 `status=SUCCEEDED`。
+
+### 1.3 按批读取结果
+
+```bash
+curl -H 'X-Scope: tenant-a' 'http://localhost:8080/api/render-jobs/{jobId}/result?chunk=0'
+```
+
+- `format=JSON`：返回行数组 `[{"id":"a1","amount":"12.50","day":"2024-01-02","active":"true"}, ...]`
+- `format=CSV`：返回 `text/csv` 文本，**首块含表头**，后续块仅数据行。
+
+`chunk` 从 `0` 开始，到 `chunkCount-1` 结束，逐块拉取即可完整还原。
+
+---
+
+## 2. 定义格式与版本兼容规则
+
+### 2.1 定义模型
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `name` | 是 | 报表名称，`[a-zA-Z0-9_-]{1,100}`，同一作用域内唯一 |
+| `description` | 否 | 描述 |
+| `columns` | 是 | 列数组，至少 1 列 |
+| `columns[].field` | 是 | 数据行字段名，`[a-zA-Z0-9_]{1,100}`，列内不允许重复 |
+| `columns[].type` | 是 | `STRING` / `NUMBER` / `DATE` / `BOOLEAN` |
+| `columns[].header` | 否 | 列标题，缺省取 `field` |
+| `columns[].format` | 否 | 格式化模式，**仅 `NUMBER` / `DATE` 允许**（非法组合会被拒绝） |
+| `columns[].transform` | 否 | 字符串转换 `UPPER` / `LOWER`，**仅 `STRING` 且格式版本 ≥ 2 允许** |
+| `sort` | 否 | 排序规则 |
+| `sort.field` | 是* | 排序列，**必须引用某个已定义列** |
+| `sort.direction` | 否 | `ASC` / `DESC`，缺省 `ASC` |
+
+### 2.2 两种版本号
+
+- **提交版本 `version`**：同一作用域下同一名称的定义，每提交一次递增 1（`1,2,3,...`）。历史版本**永远保留、不可变**，渲染时通过 `defVersion` 精确定位。
+- **格式版本 `formatVersion`**：定义*语言*的版本，决定使用哪个校验器与渲染器。当前新提交一律为 `2`。
+
+### 2.3 兼容规则（核心承诺）
+
+1. **历史版本不可变**：版本文件只追加、不覆盖。定义更新只会产生新版本，旧版本文件原封不动。
+2. **旧渲染语义永不改变**：每个格式版本绑定独立的校验器与渲染器（`RendererRegistry`）。新增能力（如 v2 的 `transform`）只注册新渲染器，**v1 定义永远走 v1 渲染器，代码行为冻结**。
+3. **存量定义无需迁移**：升级前提交的定义持久化时记录了当时的 `formatVersion`，升级后仍按该版本渲染，不需要人工迁移或重放。
+4. **渲染精确绑定版本**：作业记录 `defVersion` 与 `formatVersion`，读取方拿到的结果必然对应某个已提交版本，不存在跨版本拼接。
+5. **建议**：渲染请求始终显式传 `defVersion`，避免定义更新后输出发生非预期变化；不传则取最新版本。
+
+### 2.4 版本演进示例
+
+```
+提交 v1（columns: id, amount）  → 渲染器 V1，输出 A
+提交 v2（columns: id, amount, note）→ 渲染器 V2，输出 B（含 note）
+渲染 defVersion=1 → 永远得到 A（与提交当时逐字节一致）
+渲染 defVersion=2 → 得到 B
+```
+
+---
+
+## 3. 校验规则
+
+所有校验在**写入前**完成，错误信息定位到具体字段路径，例如：
+
+```json
+{"error":"validation failed","errors":[
+  {"field":"name","message":"name is required"},
+  {"field":"columns[0].type","message":"type must be one of STRING, NUMBER, DATE, BOOLEAN"},
+  {"field":"sort.field","message":"sort.field 'x' does not reference any column"},
+  {"field":"columns[1].field","message":"duplicate column field 'id'"}
+]}
+```
+
+覆盖的校验类别：
+
+- **字段缺失**：`name` / `columns` / `columns[].field` / `columns[].type` 等；
+- **类型不符**：字段类型不是字符串 / 数组 / 对象；
+- **引用不存在对象**：`sort.field` 引用了未定义的列；
+- **字段组合不合法**：`format` 用在 `STRING`/`BOOLEAN` 列、`transform` 用在非 `STRING` 列或格式版本不足、列字段重复、数字/日期格式模式非法；
+- **未知字段**：顶层或列内出现未声明字段（如 v1 定义出现 `transform`）。
+
+非法定义**不产生任何记录**：校验失败时不写入版本文件、不更新 `latest` 指针（见测试 `DefinitionValidationTest.invalidDefinition_leavesNoRecord`）。
+
+渲染时还会校验**数据行**：单元格类型与列类型不符会导致作业失败，错误定位到 `rows[i].field`，例如 `rows[0].amount: expected NUMBER but got String`。
+
+---
+
+## 4. 渲染语义与确定性
+
+### 4.1 确定性保证
+
+- 列输出顺序严格按定义 `columns` 顺序（`LinkedHashMap`）；
+- 数字格式化使用固定模式，日期格式化使用固定模式 + **UTC 时区**，不依赖默认区域设置；
+- 排序为**稳定排序**，`null` 永远排在末尾；
+- 渲染器无状态。同一份定义 + 同一份数据，无论执行多少次、是否并发、是否重启，输出**逐字节一致**（见测试 `DefinitionVersioningTest`、`ConcurrentRenderTest`）。
+
+### 4.2 分批输出（大数据量）
+
+- 渲染按 `batchSize` 分批，每批立即写入独立分块文件，**不一次性加载全部结果到内存**；
+- 分块先写工作目录临时文件，再通过**原子 move** 发布到 `chunks/` 目录，读者永远不会看到半写文件；
+- 输出按 `chunk` 拉取，服务端内存中最多持有一批数据。
+
+### 4.3 取消与超时
+
+- `POST /api/render-jobs/{jobId}/cancel`：置取消标记，渲染线程在**批次之间**检查并立即停止；
+- 取消 / 超时后作业置为 `CANCELLED` / `FAILED`，**已产出的分块整体丢弃**，不吐出半份结果；
+- 取消标记使用独立文件（`cancel.flag`），不会被作业状态保存覆盖；
+- 取消**不影响后续渲染**（线程池独立，见测试 `CancellationTest`）；
+- 超时通过 `timeoutMs`（请求级）或 `report.engine.render.default-timeout-ms`（全局）控制。
+
+### 4.4 失败与重启恢复
+
+- 渲染中途失败（数据类型错误、超时等）：作业置 `FAILED`，中间产物整体丢弃；
+- **重启恢复**：应用启动时扫描全部作业，仍处于 `PENDING` / `RUNNING` 的作业一律置为 `FAILED`（原因：服务重启），并丢弃中间产物 —— 重启后不存在停在中间状态且无法解释的作业；已成功的作业及其结果保留，重启后仍可读取；
+- 渲染是确定性的，客户端收到失败后用同一份定义版本与数据重新提交即可（见测试 `JobRecoveryTest`）。
+
+---
+
+## 5. 鉴权模型
+
+- 所有 `/api/**` 请求必须携带 `X-Scope` 头（作用域即租户），格式 `[a-zA-Z0-9_-]{1,64}`；
+- 定义与作业均按作用域隔离存储（`definitions/{scope}/...`、`jobs/{jobId}` 记录 scope）；
+- 越权访问其他作用域的资源（读 / 改 / 删 / 渲染 / 读结果）**一律返回 404**，与「不存在」相同，不泄漏其他作用域是否存在该资源；
+- 列表接口只返回本作用域的定义（见测试 `AuthorizationTest`）。
+
+---
+
+## 6. API 一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/definitions` | 提交定义（创建新版本） |
+| GET | `/api/definitions` | 列出本作用域定义（最新版本摘要） |
+| GET | `/api/definitions/{name}` | 读取最新版本 |
+| GET | `/api/definitions/{name}/versions/{version}` | 读取指定历史版本 |
+| DELETE | `/api/definitions/{name}` | 删除该定义的全部版本 |
+| POST | `/api/render-jobs` | 提交渲染请求 |
+| GET | `/api/render-jobs/{jobId}` | 查询作业状态 |
+| POST | `/api/render-jobs/{jobId}/cancel` | 请求取消（幂等） |
+| GET | `/api/render-jobs/{jobId}/result?chunk=n` | 按批读取结果 |
+
+所有请求需携带 `X-Scope` 头。错误响应统一为 `{"error": "..."}` 或 `{"error":"validation failed","errors":[...]}`。
+
+---
+
+## 7. 配置项
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `report.engine.data-dir` | `data` | 数据存储根目录（定义、作业、分块） |
+| `report.engine.render.core-pool-size` | `4` | 渲染线程池核心线程数 |
+| `report.engine.render.max-pool-size` | `16` | 渲染线程池最大线程数 |
+| `report.engine.render.queue-capacity` | `200` | 渲染任务队列容量（超出返回 503） |
+| `report.engine.render.batch-size` | `500` | 默认每批渲染行数（分块大小） |
+| `report.engine.render.default-timeout-ms` | `300000` | 默认渲染超时（毫秒） |
+| `report.engine.render.max-rows` | `1000000` | 单次渲染最大行数，超出拒绝 |
+
+---
+
+## 8. 存储布局
+
+```
+{data-dir}/
+  definitions/{scope}/{name}/
+    latest              # 最新版本号（原子切换）
+    versions/1.json     # 不可变的历史版本文件
+    versions/2.json
+  jobs/{jobId}/
+    job.json            # 作业状态（原子更新）
+    request-data.json   # 渲染请求数据（原子写入）
+    cancel.flag         # 取消标记（存在即取消）
+    chunks/000001.json  # 已发布分块（原子发布）
+    work/               # 临时分块目录（失败/取消时清空）
+```
+
+所有状态变更均为「临时文件 + 原子 move」，并发读取永远不会看到半写状态。
