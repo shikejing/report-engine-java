@@ -4,7 +4,8 @@
 
 - 使用方提交 JSON 声明式报表定义，服务端**完整校验**后按版本保存；
 - 渲染时**精确定位到某一个已提交的定义版本**，同一份定义 + 同一份数据反复渲染结果逐字节一致；
-- 输出**按批返回**，支持取消 / 超时，失败中间产物整体丢弃；
+- **全流式、内存有界**：请求体逐行落盘、分批渲染，带排序时使用外部归并排序；常驻内存只与单批行数相关，不随输入总行数增长；
+- 输出**按批返回**，超限输入在解析中尽早拒绝，支持取消 / 超时（大输入下检查点即时生效），失败中间产物整体丢弃；
 - 所有读写操作按 `X-Scope` 作用域鉴权，越权返回 404，不泄漏存在性。
 
 ---
@@ -152,23 +153,39 @@ curl -H 'X-Scope: tenant-a' 'http://localhost:8080/api/render-jobs/{jobId}/resul
 - 排序为**稳定排序**，`null` 永远排在末尾；
 - 渲染器无状态。同一份定义 + 同一份数据，无论执行多少次、是否并发、是否重启，输出**逐字节一致**（见测试 `DefinitionVersioningTest`、`ConcurrentRenderTest`）。
 
-### 4.2 分批输出（大数据量）
+### 4.2 分批输出与内存有界（大数据量）
 
-- 渲染按 `batchSize` 分批，每批立即写入独立分块文件，**不一次性加载全部结果到内存**；
-- 分块先写工作目录临时文件，再通过**原子 move** 发布到 `chunks/` 目录，读者永远不会看到半写文件；
-- 输出按 `chunk` 拉取，服务端内存中最多持有一批数据。
+渲染流水线是**全流式**的，无论一次提交多少行，渲染期间常驻内存都只与「单批行数」（和归并路数）相关，**不随输入总行数或请求体体积增长**：
 
-### 4.3 取消与超时
+1. **请求体流式落盘**：提交渲染时服务端不再把整个 `data` 数组反序列化进内存，而是用流式 JSON 解析器逐行读取，每行立即写入作业目录下的 `input.jsonl`（JSON-lines：`<原始序号>\t<行 JSON>`），内存中只持有当前行。临时落盘文件先写在 `{data-dir}/tmp/`（与作业目录同一文件系统），作业目录创建后**原子 move** 进去。
+2. **顺序扫描渲染（无排序）**：渲染器对 `input.jsonl` 做两遍顺序扫描 —— 第一遍逐行做单元格类型校验（与历史行为一致：全部行校验通过后才产出任何分块），第二遍按 `batchSize` 分批格式化；每批立即写入独立分块文件并释放该批内存。
+3. **外部归并排序（带排序）**：定义带 `sort` 时不做全量内存排序，而是
+   - 一遍扫描，按 `batchSize` 切分；每批在内存中排序（比较器与历史版本完全一致）后落盘为一个**归并段（run）**；
+   - 再以最多 `external-sort-fan-in` 路做多趟 k 路归并，直到归并结果按 `batchSize` 逐批产出；
+   - 归并堆以「排序键比较 + 原始输入序号决胜」组织，严格复刻稳定排序（同键保持输入顺序、`null` 永远末尾）；中间归并段被下一趟消费后立即删除。
+   - 常驻内存约为 `batchSize` 行的排序缓冲 + `fanIn` 个归并游标的当前行；归并段数量再多也不会增加常驻内存，只增加磁盘与趟数。
+4. **分块原子发布**：分块先写 `work/` 临时文件，再通过**原子 move** 发布到 `chunks/` 目录，读者永远不会看到半写文件；作业成功后清空 `work/`（`input.jsonl` 保留在作业目录，便于排查）。
 
-- `POST /api/render-jobs/{jobId}/cancel`：置取消标记，渲染线程在**批次之间**检查并立即停止；
-- 取消 / 超时后作业置为 `CANCELLED` / `FAILED`，**已产出的分块整体丢弃**，不吐出半份结果；
+> 结论：`-Xmx64m` 这样的受限堆也能稳定跑完 40 万行以上的渲染（带排序同样成立），输出顺序与内容和旧实现逐条一致。受限堆复现见 [第 9 节](#9-本地验证受限堆与大输入)。
+
+### 4.3 超限输入尽早拒绝
+
+- 服务端在**流式解析请求体的同时计数**，行数一旦超过 `report.engine.render.max-rows`，立即返回 `400`（错误字段 `data`，消息含 `maxRows`），无需等整个请求体上传 / 处理完；
+- 拒绝发生在作业记录创建**之前**：不创建 `jobs/{jobId}`、不写作业状态、不留下临时输入文件（`{data-dir}/tmp/` 中的落盘文件立即删除）—— **被拒绝的请求不产生任何作业记录或中间结果**；
+- 请求字段校验失败（`defName` / `batchSize` / `data` 类型等）、请求体不是合法 JSON，同样在任何落盘前返回 `400`。
+
+### 4.4 取消与超时
+
+- `POST /api/render-jobs/{jobId}/cancel`：置取消标记，渲染线程在**检查点**检查并立即停止；
+- 检查点分布在：输入流式扫描（每若干行）、外部排序的每个归并段 / 每趟归并 / 归并出队（每若干行）、每个分块产出之前。因此即使输入几十万行，取消或超时也会很快生效，不必等全部输入处理完；
+- 取消置 `CANCELLED`，超时置 `FAILED`（错误信息含 `timeout`），**已产出的分块整体丢弃**（`chunks/` 与 `work/` 全部清空），不吐出半份结果；
 - 取消标记使用独立文件（`cancel.flag`），不会被作业状态保存覆盖；
-- 取消**不影响后续渲染**（线程池独立，见测试 `CancellationTest`）；
+- 取消**不影响后续渲染**（线程池独立，见测试 `CancellationTest`、`LargeInputCancellationTest`）；
 - 超时通过 `timeoutMs`（请求级）或 `report.engine.render.default-timeout-ms`（全局）控制。
 
-### 4.4 失败与重启恢复
+### 4.5 失败与重启恢复
 
-- 渲染中途失败（数据类型错误、超时等）：作业置 `FAILED`，中间产物整体丢弃；
+- 渲染中途失败（数据类型错误、超时等）：作业置 `FAILED`，中间产物（含外部排序归并段）整体丢弃；
 - **重启恢复**：应用启动时扫描全部作业，仍处于 `PENDING` / `RUNNING` 的作业一律置为 `FAILED`（原因：服务重启），并丢弃中间产物 —— 重启后不存在停在中间状态且无法解释的作业；已成功的作业及其结果保留，重启后仍可读取；
 - 渲染是确定性的，客户端收到失败后用同一份定义版本与数据重新提交即可（见测试 `JobRecoveryTest`）。
 
@@ -203,15 +220,24 @@ curl -H 'X-Scope: tenant-a' 'http://localhost:8080/api/render-jobs/{jobId}/resul
 
 ## 7. 配置项
 
+所有渲染相关配置都位于 `report.engine.render.*` 前缀下（嵌套绑定，改完重启即生效）。
+
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `report.engine.data-dir` | `data` | 数据存储根目录（定义、作业、分块） |
+| `report.engine.data-dir` | `data` | 数据存储根目录（定义、作业、分块、临时输入） |
 | `report.engine.render.core-pool-size` | `4` | 渲染线程池核心线程数 |
 | `report.engine.render.max-pool-size` | `16` | 渲染线程池最大线程数 |
 | `report.engine.render.queue-capacity` | `200` | 渲染任务队列容量（超出返回 503） |
-| `report.engine.render.batch-size` | `500` | 默认每批渲染行数（分块大小） |
-| `report.engine.render.default-timeout-ms` | `300000` | 默认渲染超时（毫秒） |
-| `report.engine.render.max-rows` | `1000000` | 单次渲染最大行数，超出拒绝 |
+| `report.engine.render.batch-size` | `500` | **默认每批渲染行数（输出分块大小）**；请求未传 `batchSize` 时使用，直接决定渲染常驻内存规模 |
+| `report.engine.render.default-timeout-ms` | `300000` | 默认渲染超时（毫秒）；请求未传 `timeoutMs` 时使用 |
+| `report.engine.render.max-rows` | `1000000` | 单次渲染最大行数；**流式解析时一旦超过立即 400 拒绝**，不创建作业 |
+| `report.engine.render.external-sort-fan-in` | `64` | 带排序时外部归并排序的单趟最大归并路数（≥ 2）。常驻内存约为 `batchSize + fanIn` 行；调大则归并趟数更少、临时 IO 更少，调小则更省内存 |
+
+配置如何生效：
+
+- **优先级**：请求参数（`batchSize` / `timeoutMs`）> 服务端配置（`report.engine.render.*`）> 内置默认值；
+- 所有项都支持 Spring Boot 标准覆盖方式：`application.properties`、`--report.engine.render.batch-size=3` 命令行参数、`REPORT_ENGINE_RENDER_BATCH_SIZE=3` 环境变量等；
+- 验收示例：把默认每批行数配成 3（不改任何请求参数），渲染 10 行得到 4 块，前三块各 3 行、最后一块 1 行，逐块拉取完整还原（见测试 `RenderConfigTest`）。
 
 ---
 
@@ -219,16 +245,61 @@ curl -H 'X-Scope: tenant-a' 'http://localhost:8080/api/render-jobs/{jobId}/resul
 
 ```
 {data-dir}/
+  tmp/                  # 请求体流式落盘的临时输入（原子 move 进作业目录；拒绝时立即删除）
   definitions/{scope}/{name}/
     latest              # 最新版本号（原子切换）
     versions/1.json     # 不可变的历史版本文件
     versions/2.json
   jobs/{jobId}/
     job.json            # 作业状态（原子更新）
-    request-data.json   # 渲染请求数据（原子写入）
+    input.jsonl         # 渲染输入行文件（每行：<原始序号>\t<行JSON>，流式落盘）
     cancel.flag         # 取消标记（存在即取消）
-    chunks/000001.json  # 已发布分块（原子发布）
-    work/               # 临时分块目录（失败/取消时清空）
+    chunks/000000.json  # 已发布分块（原子发布）
+    work/               # 临时分块与外部排序归并段（run-*.jsonl），成功清空 / 失败取消时整体丢弃
 ```
 
 所有状态变更均为「临时文件 + 原子 move」，并发读取永远不会看到半写状态。
+
+---
+
+## 9. 本地验证（受限堆与大输入）
+
+### 9.1 受限堆复现内存有界
+
+自动化方式（forked JVM，默认 `-Xmx64m`，渲染 40 万行、带排序且强制多趟归并）：
+
+```bash
+mvn -Dtest=ExternalSortMemoryTest test
+# 把堆调得更小：
+mvn -Dtest=ExternalSortMemoryTest -Dmemory.test.xmx=40m test
+```
+
+该测试在 forked 进程内额外持有一块 guard 字节数组以制造堆压力：旧的全量载入实现在该堆大小下必然 `OutOfMemoryError`（退出码非 0，测试失败），流式 + 外部归并实现退出码 0 且校验输出行数、全局有序、重复键稳定顺序、分块大小。
+
+手动方式（起真实 HTTP 服务）：
+
+```bash
+mvn -DskipTests package
+java -Xmx64m \
+     -Dreport.engine.render.batch-size=1000 \
+     -jar target/report-engine-java-1.0-SNAPSHOT.jar
+
+# 另开终端：生成 40 万行输入（带排序定义），提交渲染，观察进程内存平稳、作业成功
+# 可配合 jcmd <pid> GC.heap_info / jconsole 观察堆占用不随后续行数增长。
+```
+
+### 9.2 关键自动化测试索引
+
+| 测试 | 覆盖点 |
+|---|---|
+| `ExternalSortMemoryTest` | 受限堆（40/64m）下 40 万行渲染：内存有界、排序有序与稳定、分块正确 |
+| `ExternalSortCorrectnessTest` | 外部排序输出与内存稳定排序逐条一致（重复键稳定、`null` 末尾、ASC/DESC、JSON/CSV） |
+| `RenderConfigTest` | 配置项真正生效；`batch-size=3` 渲染 10 行 → 3/3/3/1 四块并可还原 |
+| `MaxRowsRejectionTest` | 超限输入解析中立即 400 拒绝；作业目录数不增加、无临时文件残留；恰为上限可成功 |
+| `LargeInputCancellationTest` | 12 万行（含排序归并）下取消 / 超时快速生效、分块与归并段整体丢弃、不影响后续渲染 |
+
+跑全部测试：
+
+```bash
+mvn test
+```

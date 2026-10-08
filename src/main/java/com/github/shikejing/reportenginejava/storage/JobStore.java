@@ -40,4 +40,7 @@ public interface JobStore {
 
     /** 丢弃作业的全部中间产物（分块与临时文件），保留作业终态记录。 */
     void discardArtifacts(String jobId);
+
+    /** 清空工作目录中的临时文件（如外部排序归并段），保留空目录本身。 */
+    void clearWorkDir(String jobId);
 }

@@ -23,6 +23,19 @@ class CancellationTest extends IntegrationTestBase {
     @Autowired
     JobStore jobStore;
 
+    /** 轮询直到作业进入 RUNNING 且已产出至少一个分块（说明确实在渲染中）。 */
+    private void awaitRunningWithChunks(String scope, String jobId) {
+        org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(30))
+                .pollInterval(java.time.Duration.ofMillis(5))
+                .until(() -> {
+                    JobResponse j = restTemplate.exchange(
+                            "/api/render-jobs/" + jobId,
+                            org.springframework.http.HttpMethod.GET,
+                            entity(scope), JobResponse.class).getBody();
+                    return j != null && j.status() == JobStatus.RUNNING && j.chunkCount() > 0;
+                });
+    }
+
     @Test
     void cancelMidRender_discardsChunksAndDoesNotAffectLaterRenders() throws Exception {
         String scope = "s-cancel";
@@ -31,14 +44,15 @@ class CancellationTest extends IntegrationTestBase {
 
         // 大批量 + 每批 1 行，制造慢速作业
         List<Map<String, Object>> data = new ArrayList<>();
-        for (int i = 0; i < 30000; i++) {
+        for (int i = 0; i < 10000; i++) {
             data.add(row("id", "id-" + i));
         }
         String req = renderRequest("big", 1, data, "JSON", 1, null);
         JobResponse submitted = submitRender(scope, req);
         String jobId = submitted.jobId();
 
-        // 立即取消
+        // 等作业确实进入渲染（已有分块产出）后再取消，避免与线程池调度赛跑
+        awaitRunningWithChunks(scope, jobId);
         restTemplate.postForEntity("/api/render-jobs/" + jobId + "/cancel",
                 entity(scope), JobResponse.class);
 

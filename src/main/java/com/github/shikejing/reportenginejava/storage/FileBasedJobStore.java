@@ -144,6 +144,19 @@ public class FileBasedJobStore implements JobStore {
         }
     }
 
+    @Override
+    public void clearWorkDir(String jobId) {
+        Path work = workDir(jobId);
+        if (!Files.isDirectory(work)) {
+            return;
+        }
+        try (Stream<Path> entries = Files.list(work)) {
+            entries.forEach(this::deleteQuietly);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     private void deleteQuietly(Path root) {
         if (!Files.exists(root)) {
             return;

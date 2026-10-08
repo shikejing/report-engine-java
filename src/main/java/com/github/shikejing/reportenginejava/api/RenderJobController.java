@@ -7,6 +7,7 @@ import com.github.shikejing.reportenginejava.api.dto.JobResponse;
 import com.github.shikejing.reportenginejava.model.RenderFormat;
 import com.github.shikejing.reportenginejava.model.RenderJob;
 import com.github.shikejing.reportenginejava.service.RenderService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -15,13 +16,13 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestAttribute;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 
 /**
@@ -39,13 +40,17 @@ public class RenderJobController {
         this.objectMapper = objectMapper;
     }
 
-    /** 提交渲染请求。校验通过后创建作业并异步渲染。 */
+    /** 提交渲染请求。请求体流式读取：边解析边落盘，超限尽早拒绝，不整体读入内存。 */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public JobResponse submit(@RequestAttribute(ScopeFilter.SCOPE_ATTRIBUTE) String scope,
-                              @RequestBody RenderService.RenderRequest request) {
-        RenderJob job = renderService.submit(scope, request);
-        return Responses.of(job);
+                              HttpServletRequest servletRequest) {
+        try (InputStream body = servletRequest.getInputStream()) {
+            RenderJob job = renderService.submit(scope, body);
+            return Responses.of(job);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** 查询作业状态。 */
