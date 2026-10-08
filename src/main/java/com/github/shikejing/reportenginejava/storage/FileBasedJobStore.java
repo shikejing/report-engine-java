@@ -40,15 +40,13 @@ public class FileBasedJobStore implements JobStore {
 
     private final ObjectMapper objectMapper;
     private final Path jobsRoot;
+    private final Path stagingRoot;
 
     public FileBasedJobStore(ObjectMapper objectMapper, EngineProperties properties) {
         this.objectMapper = objectMapper;
         this.jobsRoot = properties.getDataDir().resolve("jobs");
-        try {
-            Files.createDirectories(jobsRoot);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        this.stagingRoot = jobsRoot.resolve(".staging");
+        ensureDirectories();
     }
 
     @Override
@@ -128,6 +126,31 @@ public class FileBasedJobStore implements JobStore {
     @Override
     public Path cancelFlag(String jobId) {
         return jobDir(jobId).resolve("cancel.flag");
+    }
+
+    @Override
+    public Path stagingDir() {
+        ensureDirectories();
+        return stagingRoot;
+    }
+
+    /**
+     * 确保根目录与暂存目录存在。除构造时调用外，每次使用暂存目录前也调用一次：
+     * 数据目录可能被外部清理（例如测试的临时目录生命周期、运维误删），
+     * 存储需要能自愈而不是永久停留在失效路径上。
+     */
+    private void ensureDirectories() {
+        try {
+            Files.createDirectories(jobsRoot);
+            Files.createDirectories(stagingRoot);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    @Override
+    public Path requestDataFile(String jobId) {
+        return jobDir(jobId).resolve("request-data.jsonl");
     }
 
     @Override

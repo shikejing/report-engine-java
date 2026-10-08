@@ -62,6 +62,28 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
     }
 
+    @ExceptionHandler(com.fasterxml.jackson.core.JacksonException.class)
+    public ResponseEntity<Map<String, Object>> handleMalformedJson(com.fasterxml.jackson.core.JacksonException e) {
+        Map<String, Object> body = Map.of("error", "malformed request body: " + e.getOriginalMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+    }
+
+    /**
+     * 请求在服务层流式解析时，Jackson 的解析异常（{@link com.fasterxml.jackson.core.JacksonException}
+     * 是受检的 IOException 子类）会被包装成 {@link java.io.UncheckedIOException}。
+     * 解包后同样按 400 处理，而不是泛化成 500。
+     */
+    @ExceptionHandler(java.io.UncheckedIOException.class)
+    public ResponseEntity<Map<String, Object>> handleUncheckedIo(java.io.UncheckedIOException e) {
+        if (e.getCause() instanceof com.fasterxml.jackson.core.JacksonException je) {
+            Map<String, Object> body = Map.of("error", "malformed request body: " + je.getOriginalMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+        }
+        log.error("unexpected IO error", e);
+        Map<String, Object> body = Map.of("error", "internal error");
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(body);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleOther(Exception e) {
         log.error("unexpected error", e);

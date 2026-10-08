@@ -38,6 +38,16 @@ public interface JobStore {
     /** 取消标记文件：存在即表示用户请求取消，渲染线程在批次之间检查。 */
     Path cancelFlag(String jobId);
 
+    /**
+     * 请求输入的暂存目录：提交请求时数据以 JSON Lines 流式落盘到这里，
+     * 作业创建后再原子移动为该作业的输入文件。该目录下的任何残留都不属于
+     * 某个已创建作业，可被安全清理（被拒绝的请求不产生作业记录）。
+     */
+    Path stagingDir();
+
+    /** 作业的流式输入数据文件（JSON Lines，每行一个数据对象）。 */
+    Path requestDataFile(String jobId);
+
     /** 丢弃作业的全部中间产物（分块与临时文件），保留作业终态记录。 */
     void discardArtifacts(String jobId);
 }

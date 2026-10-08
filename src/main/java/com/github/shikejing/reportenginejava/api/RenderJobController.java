@@ -7,6 +7,7 @@ import com.github.shikejing.reportenginejava.api.dto.JobResponse;
 import com.github.shikejing.reportenginejava.model.RenderFormat;
 import com.github.shikejing.reportenginejava.model.RenderJob;
 import com.github.shikejing.reportenginejava.service.RenderService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -15,7 +16,6 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestAttribute;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -39,13 +39,23 @@ public class RenderJobController {
         this.objectMapper = objectMapper;
     }
 
-    /** 提交渲染请求。校验通过后创建作业并异步渲染。 */
+    /**
+     * 提交渲染请求。
+     *
+     * <p>直接把原始请求字节流交给渲染服务流式解析 / 落盘 / 计数，
+     * 不经 Spring 的整体反序列化，因此服务端不会把 {@code data}
+     * 一次性读入内存；行数超限时在读取过程中即返回 400。
+     */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public JobResponse submit(@RequestAttribute(ScopeFilter.SCOPE_ATTRIBUTE) String scope,
-                              @RequestBody RenderService.RenderRequest request) {
-        RenderJob job = renderService.submit(scope, request);
-        return Responses.of(job);
+                              HttpServletRequest request) {
+        try {
+            RenderJob job = renderService.submit(scope, request.getInputStream());
+            return Responses.of(job);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** 查询作业状态。 */

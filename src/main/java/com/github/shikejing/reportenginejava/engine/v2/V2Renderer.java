@@ -1,5 +1,6 @@
 package com.github.shikejing.reportenginejava.engine.v2;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.shikejing.reportenginejava.engine.ValidatorRegistry;
 import com.github.shikejing.reportenginejava.engine.v1.V1Renderer;
 import com.github.shikejing.reportenginejava.model.Column;
@@ -16,8 +17,8 @@ public class V2Renderer extends V1Renderer {
 
     public static final int FORMAT_VERSION = 2;
 
-    public V2Renderer(ValidatorRegistry validatorRegistry) {
-        super(validatorRegistry);
+    public V2Renderer(ValidatorRegistry validatorRegistry, ObjectMapper objectMapper) {
+        super(validatorRegistry, objectMapper);
     }
 
     @Override
